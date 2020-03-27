@@ -1,0 +1,559 @@
+---
+title: "The impact of NBA officials on game outcomes"
+author: "Mark Felepchuk"
+date: "7/16/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(downloader)
+library(tidyverse)
+library(htmltab)
+library(lubridate)
+library(XML)
+library(caret)
+library(e1071)
+library(doParallel)
+library(RCurl)
+library(ggplot2)
+library(knitr)
+library(RColorBrewer)
+library(scales)
+
+
+fullSet <- read_csv('/Users/mfelepchuk/Desktop/Data Science Fun/NBA/fullSet.csv')
+schedule <- read_csv('/Users/mfelepchuk/Desktop/Data Science Fun/NBA/schedule.csv')
+
+```
+
+
+There’s always a lot of talk amongst basketball fans of any team thinking the referees are biased towards their team. Houston fans don’t like Scott Foster very much, and in all fairness most fans don’t like Scott Foster very much. Tony Brothers has a bad reputation amongst NBA players. In a recent player survey, Tony Brothers, Scott Foster and Marc Davis ranked as the top three ‘worst referees’. 
+
+Looking at the post-lockout NBA (2013-2019), I’ve scrapped data from <http://basketball-reference.com> that takes box score data for regular season and playoff games and connects it to referee assignments for each game. 
+
+### Getting the data
+
+All the data that I'm using came from scrapping <http://basketball-reference.com>, except for team abbreviations, which I got from Wikipedia and made some edits to align with Basketball-Reference's abbreviations (you can see these changes in the code).  Unfortunately Basketball-Refernce doesn't have an API, but their website is pretty easy to navigate using the functions htmltab and readfile. So here are the steps to getting the data:
+
+#### 1. Download team abbreviations
+
+Like I mentioned above, team abbreviations were taken from Wikipedia and some edits were made to align with Basketball-Reference. The following htmltab function reads the html table from Wikipedia and turns the data into a tibble. I then make some edits to Charlotte, Phoenix and Brooklyn to align with Basketball-Reference's naming conventions. I also added in two new abbreviations for teams that don't exist anymore - the Charlotte Bobcats and the New Orleans Hornets.
+
+```{r, eval=FALSE}
+team_abbs <- as.tibble(htmltab("https://en.wikipedia.org/wiki/Wikipedia:WikiProject_National_Basketball_Association/National_Basketball_Association_team_abbreviations", which=1))
+
+team_abbs[team_abbs$`Abbreviation/Acronym`=='CHA',]$`Abbreviation/Acronym` = "CHO"
+team_abbs[team_abbs$`Abbreviation/Acronym`=='PHX',]$`Abbreviation/Acronym` = "PHO"
+team_abbs[team_abbs$`Abbreviation/Acronym`=='BKN',]$`Abbreviation/Acronym` = "BRK"
+team_abbs = rbind(team_abbs, c('NOH', 'New Orleans Hornets'))
+team_abbs = rbind(team_abbs, c('CHA', 'Charlotte Bobcats'))
+```
+
+#### 2. Get the schedules
+
+For this analysis I'm looking at officiating patterns from the post-lockout era (2013 to 2019). I need to access boxscore data for each game to get the official assignments for those games. Each game is located in an html file with the address of 'YEAR+MONTH+DAY+0+HOMEABBREVIATION.html'. For example, Philiadelphia's October 16, 2018 game in Boston would be coded as 201810160BOS.html. The full URL would be: <https://www.basketball-reference.com/boxscores/201810160BOS.html>. 
+
+To access the data for each of these games, I need the schedules for each season from 2013 to 2019. Basketball-Reference has a table for each month of each season. For the month of October, the url doesn't have a month identifier and for November to June, it includes a '-month' in the url. So for the 2019 Season, October's schedule would be here: <https://www.basketball-reference.com/leagues/NBA_2019_games.html> and November's would be here: <https://www.basketball-reference.com/leagues/NBA_2019_games-november.html>.
+
+I set up a for loop and goes through the 2013 to 2019 seasons and downloads the schedules for each month into a single tibble. Here's what that code looks like:
+
+``` {r, eval=FALSE}
+schedule <- tibble()
+
+months <- c('','-november', '-december', '-january','-february','-march','-april','-may','-june')
+years <- 2013:2019
+
+for (year in years){
+  print(year)
+  for (month in months){
+    print(month)
+    dest <- paste('https://www.basketball-reference.com/leagues/NBA_',year,'_games', month,'.html', sep='')
+    
+    temp <- as.tibble(htmltab(dest, which=1)) %>% 
+      mutate(Month = substring(Date,6,8), Day = ifelse(str_detect(substring(Date, 10,11),','),substring(Date, 10,10),substring(Date, 10,11)), Year = substring(Date,nchar(Date)-3,nchar(Date)), 
+             dateClean = mdy(paste(Month, Day, Year)))
+  
+    schedule <- schedule %>% bind_rows(temp)
+  }
+}
+
+names(schedule)[3] <- 'Away'
+names(schedule)[4] <- 'AwayPTS'
+names(schedule)[5] <- 'Home'
+names(schedule)[6] <- 'HomePTS'
+
+schedule <- schedule %>% left_join(team_abbs, by=c("Home"="Franchise"))
+names(schedule)[13] = "HomeABB"
+schedule <- schedule %>% left_join(team_abbs, by=c("Away"="Franchise"))
+names(schedule)[14] = "AwayABB"
+```
+
+The last few lines just rename some columns that have ugly names from the htmltab function. The schedule tibble only has the teams' full names and I need the abbreviations for the html code to access the boxscores. So I left join team abbreviations for both the home and away team's full names.
+
+I then need to build my html boxscore code. I'm calling this variable htmlCode. I need to stitch together date and home team abbreviation in the correct format to access the correct webpage (as discussed above).
+
+```{r, eval=FALSE}
+schedule <- schedule %>% mutate(htmlCode = paste(year(dateClean), ifelse(nchar(month(dateClean))==1,paste(0,month(dateClean),sep=''), month(dateClean)), ifelse(nchar(day(dateClean))==1,paste(0,day(dateClean),sep=''),day(dateClean)), 0, HomeABB, sep=""))
+```
+
+#### 3. Download the box score data - warning: here comes a really big for loop.
+
+Now comes the fun part. Located in each boxscore webpage are two data tables that I want - home and away boxscores - and I can access these using the htmltab function.I also want the Pace statistic to adjust fouls per game to fouls per 100 possessions and I want to get the names of the officials. Pace and official assignments are not located in html tables so I can't use htmltab. What I need to do is look through the html source file and find a pattern of characters that can be used to pull the data.
+
+##### Official Names
+
+Here's the part of the for loop that will take the official assignments for the boxscore with the correct htmlCode.
+
+```{r, eval=FALSE}
+    htmlfile <- read_file(paste('https://www.basketball-reference.com/boxscores/', htmlCode, '.html', sep=''))
+    
+    startString <- str_locate(htmlfile, 'Officials:')
+    endString <- str_locate(htmlfile, 'Attendance:')
+    
+    tempString <-substring(htmlfile, startString, endString)
+    
+    firstOfficialStart <- str_locate(tempString,'r.html')
+    tempString <- substring(tempString, firstOfficialStart[1,2]+3)
+    firstOfficialEnd <- str_locate(tempString,'<')
+    firstOfficial <- substring(tempString, 1, firstOfficialEnd[1,2]-1)[1]
+    secondOfficialStart <- str_locate(tempString,'r.html')
+    tempString <- substring(tempString, secondOfficialStart[1,2]+3)[1]
+    secondOfficialEnd <- str_locate(tempString,'<')
+    secondOfficial <- substring(tempString, 1, secondOfficialEnd[1,2]-1)[1]
+    thirdOfficialStart <- str_locate(tempString,'r.html')
+    tempString <- substring(tempString, thirdOfficialStart[1,2]+3)[1]
+    thirdOfficialEnd <- str_locate(tempString,'<')
+    thirdOfficial <- substring(tempString, 1, thirdOfficialEnd[1,2]-1)[1]
+```
+
+Looking at the html source code, I found that the string pattern 'Official:' was where the official's names started and the string pattern: 'Attendance:' was what came after the last official's name. It took a bit of trial and error to get the correct start and end points for each official, but essentially, I'm making a temporary string that takes the characters between the word 'Official:' and the word 'Attendance:'. For the first official I'm looking at the source code to get where it is located and trimming a string to get the first officials name. I do the same thing for the second and third officials. Basically it's a bit of data wrangling using the Stringr package from the Tidyverse. 
+
+##### Pace data
+
+Pace data was a bit harder to locate and required a bit more trial and error, but I used the same process to find it as I did for the officials' names. I needed to include an str_remove function sinc epace statistics greater than/equal to 100.0 are five characters long and anything less is four characters long. I always take five characters into my pace variable and use str_remove to take away a '<' if it was part of the five characters I read in. A '<' occurred right after the last digit of pace, so four character pace statistics would look like '94.6<' compared to a five character statistic, like '101.3'. I then wrap it in as.numeric() to get a number.
+
+Here's the code:
+
+``` {r, eval=FALSE}
+    pace_loc <- str_locate_all(htmlfile, fixed('data-stat=\"pace'))[[1]][3,2]
+    pace <- as.numeric(str_remove(substring(htmlfile,pace_loc+4, pace_loc+8),"\\<"))
+```
+
+##### Putting it all together
+
+Here's the entire for-loop. It starts by pulling the officials' names, finds the pace statistics and then downloads the boxscores. I append the officals' names to each home and visitor table along with pace and then append both to a tibble called fullSet. If 10 players played for each team in a game, the game would occupy 60 observations in the fullSet tibble (10 players x 2 teams x 3 officials). 
+
+```{r, eval=FALSE}
+for (htmlCode in schedule$htmlCode){
+#Get the ref data
+  tryCatch({
+    htmlfile <- read_file(paste('https://www.basketball-reference.com/boxscores/', htmlCode, '.html', sep=''))
+    
+    startString <- str_locate(htmlfile, 'Officials:')
+    endString <- str_locate(htmlfile, 'Attendance:')
+    
+    tempString <-substring(htmlfile, startString, endString)
+    
+    firstOfficialStart <- str_locate(tempString,'r.html')
+    tempString <- substring(tempString, firstOfficialStart[1,2]+3)
+    firstOfficialEnd <- str_locate(tempString,'<')
+    firstOfficial <- substring(tempString, 1, firstOfficialEnd[1,2]-1)[1]
+    secondOfficialStart <- str_locate(tempString,'r.html')
+    tempString <- substring(tempString, secondOfficialStart[1,2]+3)[1]
+    secondOfficialEnd <- str_locate(tempString,'<')
+    secondOfficial <- substring(tempString, 1, secondOfficialEnd[1,2]-1)[1]
+    thirdOfficialStart <- str_locate(tempString,'r.html')
+    tempString <- substring(tempString, thirdOfficialStart[1,2]+3)[1]
+    thirdOfficialEnd <- str_locate(tempString,'<')
+    thirdOfficial <- substring(tempString, 1, thirdOfficialEnd[1,2]-1)[1]
+    
+    pace_loc <- str_locate_all(htmlfile, fixed('data-stat=\"pace'))[[1]][3,2]
+    pace <- as.numeric(str_remove(substring(htmlfile,pace_loc+4, pace_loc+8),"\\<"))
+    
+    #Now get the player data
+    
+    boxscore_link <- paste('https://www.basketball-reference.com/boxscores/',htmlCode,'.html',sep='')
+    
+    home <- htmltab(boxscore_link, which=3)
+    game <- schedule[schedule$htmlCode == htmlCode,]
+    home$HomeTeam = game$HomeABB
+    home$Date = game$dateClean
+    home$Result = ifelse(game$HomePTS > game$AwayPTS, 1,0)
+    
+    home <- home %>%  filter(!str_detect(Starters, 'Reserves'))  %>%
+      filter(!str_detect(`Basic Box Score Stats >> MP`, 'Did Not Play')) %>% 
+      select(Name = Starters, Team = HomeTeam, Date = Date, FTA = `Basic Box Score Stats >> FTA`, 
+             PF = `Basic Box Score Stats >> PF`) %>% mutate(Pace = pace, firstOfficial = firstOfficial, secondOfficial = secondOfficial, 
+             thirdOfficial = thirdOfficial) %>%   gather(key='OfficialNumber', value='Official',firstOfficial:thirdOfficial)
+  
+  
+    away <- htmltab(boxscore_link, which=1)
+    away$AwayTeam = game$AwayABB
+    away$Date = game$dateClean
+    away$Result = ifelse(game$HomePTS > game$AwayPTS, 0,1)
+    
+    away <- away %>%  filter(!str_detect(Starters, 'Reserves'))  %>%
+      filter(!str_detect(`Basic Box Score Stats >> MP`, 'Did Not Play')) %>% 
+      select(Name = Starters, Team = AwayTeam, Date = Date, FTA = `Basic Box Score Stats >> FTA`, 
+             PF = `Basic Box Score Stats >> PF`) %>% 
+      mutate(Pace = pace, firstOfficial = firstOfficial, secondOfficial = secondOfficial, thirdOfficial = thirdOfficial) %>%   
+      gather(key='OfficialNumber', value='Official',firstOfficial:thirdOfficial)
+    
+    home <- home %>% mutate(OppFouls = sum(as.numeric(away$PF))/3)
+    away <- away %>% mutate(OppFouls = sum(as.numeric(home$PF))/3)
+    
+    fullSet <- fullSet %>% bind_rows(home, away)
+    closeAllConnections()}, error=function(e){cat("ERROR :", htmlCode, " ", conditionMessage(e), "\n")})
+
+      }
+```
+
+Everything is put inside a tryCatch function to output errors without exiting the loop. For some reason, the occasional game won't download properly (I get an XML error). I think it may have to do with page load time. Since I'm looking at seven years of games, I'm okay with losing a few observations. In the end I get about 450,000 observations, dividing by 60 means that about 7,500 games of information. That represents about 80% of all games played (assuming all playoff series go to seven games). For the purposes of this analysis I think it is sufficient.
+
+#### 4. Cleaning the dataset
+
+Now that I have fullSet, I realized that I wanted the winner of each game as well. Rather than re-downloading the data (which takes forever!) I created a tibble called winnerName that duplicates the schedule for the home team and away team so I can left join it against fullSet and the Team name column. I then used mutate for create a variable called 'Win' that tests if the Winner of the game (included in winnerName) is equal to the Team's name from the boxscore. If it is, they get a 1 if not a 0. When averaged over the season, I'll have the team's win percentage.
+
+The next interesting variable is the PacePF variable. When I first started looking at the data I didn't include pace and it skewed the results such that slower-paced teams had fewer fouls called than faster-paced teams. This makes sense, since there are less opportunities to call fouls if there are less possessions in a game. PacePF takes the total fouls called in a game and divides it by the number of possession in the game and then multiplies it by 100 to get the number of fouls per 100 possessions. This adjusts for pace.
+
+I also included a variable called Opponent that I use to left_join Opponent win percentage on. Additional mutates include creating some factors to be used later and creating a nested if statement to get a Season variable so I can filter based on season later on.
+
+```{r}
+schedule_result <- schedule %>% mutate(Winner = ifelse(HomePTS > AwayPTS, HomeABB, AwayABB)) %>% 
+  select(dateClean, HomeABB, AwayABB, Winner)
+
+winnerName <- bind_rows(schedule_result %>% mutate(Team = HomeABB), schedule_result %>% mutate(Team = AwayABB))
+
+fullSet1 <- fullSet %>% left_join(winnerName, by=c("Date" = "dateClean", "Team" = "Team")) %>%
+  mutate(Win = ifelse(Winner == Team, 1, 0)) %>% mutate(Name = as.factor(Name), Team=as.factor(Team), FTA=as.numeric(FTA), PF = as.numeric(PF), 
+                               PacePF = 100*PF/Pace,
+                               OfficialNumber=as.factor(OfficialNumber),
+                               Official=as.factor(Official)) %>% na.omit() %>%
+  mutate(Season=ifelse(Date <'2013-07-01',2013,
+                ifelse(Date < '2014-07-01', 2014,
+                       ifelse(Date < '2015-07-01',2015,
+                              ifelse(Date <'2016-07-01', 2016,
+                                     ifelse(Date < '2017-07-01', 2017,
+                                            ifelse(Date < '2018-07-01', 2018,
+                                                   ifelse(Date < '2019-07-01', 2019
+                                                          ))))))),
+         Opponent = ifelse(HomeABB==Team, AwayABB, HomeABB)) %>%
+  select(-HomeABB, -AwayABB) 
+
+games_played <- fullSet1 %>% count(Team, Date, Season, sort = TRUE) %>% count(Team, Season)
+games_reffed <- fullSet1 %>% count(Team, Date, Official, Season) %>% count(Team, Season, Official)
+game_data <- fullSet1  %>% group_by(Team, Date, Season, Official, Opponent) %>% summarise(Fouls = sum(PacePF), OppFouls = sum(100*OppFouls/Pace)/n(), FoulDiff = Fouls-OppFouls, Win = mean(Win))
+
+foulsPerGame <- fullSet1 %>% group_by(Team, Official, Season) %>% summarise(Fouls=sum(PacePF), WinPct = mean(Win)) %>% left_join(games_reffed) %>% mutate(FPG = Fouls/nn)
+
+OfficialAvg <- foulsPerGame %>%group_by(Season, Official) %>% summarise(SeasonAvg=mean(Fouls/nn))
+TeamAvg <- foulsPerGame %>%group_by(Season, Team) %>% summarise(TeamSeasonAvg=mean(Fouls/nn), SeasonWinPct = mean(WinPct))
+
+fullSet1 <- fullSet1 %>% left_join(TeamAvg, by=c("Opponent"="Team", "Season" = "Season")) %>% 
+  mutate(OpponentPCT = SeasonWinPct) %>% select(-SeasonWinPct, -TeamSeasonAvg)
+
+foulsPerGame <- fullSet1 %>% group_by(Team, Official, Season) %>% summarise(Fouls=sum(PacePF), WinPct = mean(Win), OpponentPct = mean(OpponentPCT)) %>% left_join(games_reffed) %>% mutate(FPG = Fouls/nn)
+
+
+#Need to change these to PacePF rather than PFs...
+foulsByTeam <- fullSet1 %>% group_by(Date, Team) %>% summarise(Fouls=sum(PacePF)/3, FTA = sum(FTA)/3)
+foulsByTeamRef <- fullSet1 %>% group_by(Date, Team, Official) %>% summarise(Fouls=sum(PacePF), FTA = sum(FTA))
+
+```
+
+Now we can get into some analysis.
+
+### Officials are pretty consistent year-over-year
+
+Here’s a distribution of the fouls called per game in the NBA from 2013 to 2019. I've included a typical density function (this is the bell-curve looking chart) and a cumulative distribution function. Cumulative distribution functions (CDFs) can be intrepreted as follows: when a line is closer to the left, it means a greater proportion of games have fewer fouls called per 100 possessions than a line that is skewed to the right. For example in the CDF below, which shows fouls per 100 possessions over the 2013 to 2019 period, in 2018 (the purple line) 50% of games had 20 or fewer fouls per 100 possessions called. 
+
+As you can see, the distributions are pretty similar year-over-year. In the season that just ended, fouls per 100 possessions were right in line with other years (this is the pink line) and more than in 2018, where fouls per 100 possessions were the lowest compared to previous seven years (this is the purple line).
+
+```{r }
+
+ggplot(game_data, aes(x=Fouls, color=as.factor(Season))) + 
+  geom_density() + theme(legend.title = element_blank()) + xlab("Fouls per 100 possessions") +ylab("") + ggtitle('Distribution of Fouls per 100 Possessions')
+
+ggplot(game_data, aes(x=Fouls, color=as.factor(Season))) + 
+  stat_ecdf(geom='smooth') + theme(legend.title = element_blank()) + xlab("Fouls per 100 possessions") +ylab("") +
+  ggtitle('Cumulative distribution of Fouls per 100 Possessions')
+
+
+```
+
+### Some teams get called for more fouls...
+
+Looking across all years, there are certain teams that have more fouls called per 100 possessions than others. From 2013 to 2019, there was a differential of about 4 fouls called per 100 possessions between the most penalized team, the NBA Champion Toronto Raptors (23.2 fouls per 100 possessions) and the least penalized team, the San Antonio Spurs (19.0 fouls per 100 possessions). Other notable teams near the top are the Memphis Grizzlies (23.0), Phoenix Suns (22.8) and Oklahoma City Thunder (22.7). And some big names at the bottom in addition to the Spurs are the Charlotte Hornets (19.4), Minnesota Timberwolves (20.3) and the Atlanta Hawks (20.4). 
+
+```{r }
+fpt <- foulsByTeam  %>% mutate(Team=as.character(Team))  %>% mutate(Team = ifelse(Team=="NOH","NOP", ifelse(Team=="CHA", "CHO", Team))) %>% group_by(Team) %>% summarise(FoulsPer100Pos = mean(Fouls)) %>% arrange(desc(FoulsPer100Pos))
+
+## Above I combined the Charlotte Hornets and Charlotte Bobcats into one team abbreviation and the New Orleans Hornets and New Orleans Pelicans into another. 
+
+kable(fpt)
+```
+
+This is an interesting result. I didn't expect to see such a wide spread after adjusting for pace. I'm going to look more at the top penalized team and the bottom penalized team.
+
+### The NBA Champion Toronto Raptors don't have the same statistical distrbution of fouls called
+
+##### Warning: I'm a Raptors fan, but I'm going to hopefully let the statistics do the talking...
+
+Using the Kolmogorov-Smirnov test (KS-test), you can compare if two sample distributions are from the same population. I'm using the KS-test here to ask "is the difference in fouls called on the Raptors statistically different than fouls called on the rest of the league?"
+
+So what does the KS-test say? 
+
+```{r, message=FALSE, warning=FALSE}
+kstest = tibble()
+
+notTOR <- game_data %>% mutate(TorontoFlag = ifelse(Team=="TOR", "TOR", "OTHER"))
+
+for (season in unique(notTOR$Season)){
+  a <- ks.test(filter(notTOR, Season==season & TorontoFlag=="OTHER")$Fouls,filter(notTOR, Season==season & TorontoFlag=="TOR")$Fouls)
+  result <- tibble(Season=season, PValue = round(a$p.value,20),Result = ifelse(a$p.value<0.05,'Statistically Different', 'Statistically Similar') )
+  kstest <- kstest %>% bind_rows(result)
+}
+
+kable(kstest)
+
+```
+
+Every season was statistically different than the rest of the NBA except for 2016. This means that fouls per 100 possessions called on the Raptors would be expected to be drawn from a different population than fouls called on other teams. Graphically, this can be shown using cumulative distribtuion functions. 
+
+```{r }
+
+ggplot(notTOR, aes(x=Fouls, color = as.factor(TorontoFlag))) + stat_ecdf(geom='smooth') + 
+ theme(legend.title = element_blank()) + xlab("Fouls per 100 possessions") +ylab("") +
+  ggtitle('Cumulative distribution of Fouls per 100 Possessions: Toronto Raptors (2013-2019)')
+
+```
+
+And for completeness, here are the CDFs for each year from 2013 to 2019.
+
+```{r }
+
+ggplot(notTOR, aes(x=Fouls, color = as.factor(TorontoFlag))) + stat_ecdf(geom='smooth') + 
+  facet_wrap(vars(Season)) + theme(legend.title = element_blank()) + xlab("Fouls per 100 possessions") +ylab("") +
+  ggtitle('Cumulative distribution of Fouls per 100 Possessions: Toronto Raptors')
+
+```
+
+### What's with the Spurs: Enter the upside-down
+
+Since pace is adjusted for in the data, I think there must be a Popvich factor as their foul counts are low. These are the CDFs for the Spurs:
+
+```{r }
+notSAS <- game_data %>% mutate(SanAntonioFlag = ifelse(Team=="SAS", "SAS", "OTHER"))
+
+ggplot(notSAS, aes(x=Fouls, color = as.factor(SanAntonioFlag))) + stat_ecdf(geom='smooth') + 
+ theme(legend.title = element_blank()) + xlab("Fouls per 100 possessions") +ylab("") +
+  ggtitle('Cumulative distribution of Fouls per 100 Possessions: San Antonio Spurs (2013-2019)')
+
+```
+
+From 2013 to 2019, in 75% of games the Spurs were called for about 21 or fewer fouls, compared to 50% of games for the rest of the league.
+
+And for completeness, here are the CDFs for each year from 2013 to 2019.
+
+```{r }
+
+ggplot(notSAS, aes(x=Fouls, color = as.factor(SanAntonioFlag))) + stat_ecdf(geom='smooth') + 
+  facet_wrap(vars(Season)) + theme(legend.title = element_blank()) + xlab("Fouls per 100 possessions") +ylab("") +
+  ggtitle('Cumulative distribution of Fouls per 100 Possessions: San Antonio Spurs')
+
+```
+
+And here are the KS-tests. As you'd expect, the distributions aren't similar to the league as a whole. Every season sees the Spurs with a statistically different distribution. 
+
+```{r, message=FALSE, warning=FALSE}
+kstest = tibble()
+for (season in unique(notSAS$Season)){
+  a <- ks.test(filter(notSAS, Season==season & SanAntonioFlag=="OTHER")$Fouls,filter(notSAS, Season==season & SanAntonioFlag=="SAS")$Fouls)
+  result <- tibble(Season=season, PValue = round(a$p.value,20),Result = ifelse(a$p.value<0.05,'Statistically Different', 'Statistically Similar') )
+  kstest <- kstest %>% bind_rows(result)
+}
+
+kable(kstest)
+```
+
+
+### So do certain officials call a tighter game for certain teams?
+
+When taking into account the officiating patterns for specific refs, I've made three adjustments: official adjustments, team adjustments and win percentage adjustments. I've established above that certain teams (cough: Raptors) seem to have a disadvantage when it comes to overall fouls called independent of the referees. 
+
+To see if there are certain officiating patterns, I've taken the data set and looked at fouls called per 100 possessions by referee and by season. 
+
+For example, here are the top five teams that Marc Davis called the most fouls on in the 2017 to 2019 seasons.
+
+```{r}
+
+diffPlotData <- foulsPerGame %>% arrange(desc(FPG)) %>% left_join(OfficialAvg) %>% left_join(TeamAvg) %>%
+  mutate(TeamDifferential = FPG-TeamSeasonAvg, PctImpact = 1 + (WinPct - (SeasonWinPct/(OpponentPct+SeasonWinPct)))) %>% 
+  mutate(RefImpact = as.numeric(100*(FPG/SeasonAvg)*(2-FPG/TeamSeasonAvg)*(1/PctImpact))) %>%
+  select(-TeamDifferential) %>% 
+  arrange(desc(RefImpact))
+
+k<-diffPlotData %>% filter(Official=="Marc Davis" & Season==2019) %>% 
+  select(Season, Team, Official, GamesOfficiated=nn, FoulsPer100Possessions = FPG) %>% 
+  arrange(desc(FoulsPer100Possessions)) %>% head(5)
+
+kable(k)
+
+```
+
+The issue with looking purely at fouls per 100 possessions and saying: 'wow Marc Davis really hates the Suns' is that we're not comparing Marc Davis feelings towards the Suns to:
+1. How Marc Davis calls games against the rest of the league in that season, and, 
+2. How all the officials call games against the Suns in that season. 
+
+#### Foul adjustments
+
+I've made two adjustments to the data to try to capture these issues related to fouls called in games.
+
+The first is an 'official' adjustment. It takes the percent difference between the average fouls called per 100 possessions per team for that official in that season.
+
+The second is the 'team' adjustment. As shown above, some teams just get more fouls called on them. Either due to style of play, pace or 'league consipracy' (I jest). This adjustment takes the percentage difference in the team's average fouls called per 100 possessions by season and the average number of fouls called by the official in question to get an idea of the number of fouls called by the offical given the average reputation of the team. 
+
+So for example, in Phoenix Suns games officiated by Marc Davis in 2019, the Suns averaged 25.8 fouls per 100 possessions (this is the FPG variable, below). Across the entire season, the Suns averaged 23.7 fouls per 100 possessions (this is the TeamSeasonAvg variable, below), while Marc Davis called 21.2 fouls per 100 possessions across all of his games in 2019 (this is the SeasonAvg variable, below). 
+
+The Official Adjustment would be 25.7673/21.15367 = 1.218101 - meaning Marc Davis called about 22% more fouls on the Suns than he did on average.
+
+The Team Adjustment would be 25.7673/23.727 = 1.085991  - meaning in games officiated by Marc Davis, the Suns had about 9% more fouls called than they did on average.
+
+Combining the Official Adjustment x Team Adjustment gives a foul impact of 1.218101 x (1-0.085991) = 1.113355. So introducing Marc Davis to Phoenix Suns games in 2019 led to an increase in fouls per 100 possessions of about 11%.
+
+```{r, }
+kable(diffPlotData %>% filter(Season=="2019", Team=="PHO", Official=="Marc Davis") %>% select(Team, Official, Season, FPG, SeasonAvg, TeamSeasonAvg) %>% mutate(OfficialAdjustment = FPG/SeasonAvg, TeamAdjustment = FPG/TeamSeasonAvg) %>% mutate (FoulImpact = OfficialAdjustment*(2-TeamAdjustment)))
+```
+
+
+#### Refs can affect the game in ways that aren't seen through fouls
+
+So when I started this analysis I was going to solely focus on fouls and figure out an official's impact on a game through fouls called. However, I realized while pulling some data together that I wouldn't be telling the whole story. There can be other missed calls or no-calls or strange decisions that aren't related specifically to personal fouls. I decided to add in another variable that would look at win percentages. Since teams may have terrible win percentages with specific refs. 
+
+A prime example was seen in the 2019 playoffs when the Houston Rockets had Scott Foster assigned to their game and the basketball analysts were quick to point out the Rockets terrible record with Scott Foster officiating their games in the playoffs. 
+
+I've tried to measure the impact of officials on win percentage by looking at:
+  A. The team's win percentage in the season for all games in the dataset
+  B. The opponent's win percentage in the season for all games in the dataset, and,
+  C. The team's win percentage in games officiated by the referee in question in the season
+  
+Using these three inputs, I've proposed a Win Percentage Impact metric that is calculated as: 
+
+(1 + (Team's Win Pct With Specific Ref - (Team's Overall Season Win Pct/(Opponent's Win Percentage in the Season +Team's Overall Season Win Pct)
+
+  Or
+
+WinPctImpact =  1 + (C - (A/(A+B))) - using the letters above.
+
+I'm trying to capture what would have been expected for the outcome (thats the A/(A+B)) and am subtractitng it from what the result was in those games with that official. I add one to the number to get it centered around one rather than around zero.
+
+This may not be perfect, but it gives a scale centered around 1 where an impact greater than 1 is in favour of the team and an impact less than 1 would be considered a negative bias.
+
+So for Phoenix and Marc Davis again, the WinPctImpact would be:
+
+WinPctImpact =  1 + (0.3333 - (0.4731994/(0.4731994+0.495598))) = 0.8448933.
+
+
+```{r, }
+kable(diffPlotData %>% filter(Season=="2019", Team=="PHO", Official=="Marc Davis") %>% select(Team, Official, Season, RefWinPct = WinPct, SeasonWinPct, OpponentPct) %>% mutate(WinPctImpact = (1+(RefWinPct - SeasonWinPct/(SeasonWinPct+OpponentPct))) ))
+```
+
+
+#### Putting it all together
+
+To get an overall RefImpact score, I multiply FoulImpact by the inverse of WinPctImpact. I take the inverse so they're both moving in the same direction (i.e., greater than one is a 'disadvantage' and less than one is an 'advantage'). I then multiply this by 100, since everyone always like things being out of 100. So a perfectly unbiased ref for a specific team would have a RefImpact score of 100.
+
+```{r}
+diffPlotData <- foulsPerGame %>% arrange(desc(FPG)) %>% left_join(OfficialAvg) %>% left_join(TeamAvg) %>%
+  mutate(RefWinPct = WinPct) %>% mutate(OfficialAdjustment = FPG/SeasonAvg, TeamAdjustment = FPG/TeamSeasonAvg) %>% 
+  mutate (FoulImpact = OfficialAdjustment*(2-TeamAdjustment)) %>% 
+  mutate(WinPctImpact = (1+(RefWinPct - SeasonWinPct/(SeasonWinPct+OpponentPct)))) %>% 
+  mutate(RefImpact = 100*FoulImpact*(1/WinPctImpact)) %>%
+  arrange(desc(RefImpact))
+```
+
+The table below shows the largest RefImpacts for each Team:Official combination in the 2019 season (number of games officiated greater than or equal to five). The toughest Official:Team pairing is Mark Lindsay with the Portland Trailblazers. His RefImpact score is nearly 200. He calls slightly more fouls than average, but their win percentage is terrible with Mark.
+
+```{r}
+  kable(diffPlotData %>% filter(Season==2019, nn>=5) %>% select(Season, Team, Official, FoulImpact, WinPctImpact, RefImpact) %>% group_by(Team) %>% top_n(1))
+```
+
+A name you won't see on the list is Scott Foster, which begs the question:
+
+### Does Scott Foster hate us?
+
+I mean, if you're a Raptors fan, no not really. Officiating Toronto's 2019 games, Foster had a score of 95.8. This means the Raptors actually do slightly better in games Foster officiates. He calls about an even number of fouls and the Raptors win percentage is slightly higher than expected when Scott shows up. Even I'm surprised by this. People may think he's not the best official (I tend to agree) but he seems to be equally subpar towards both teams rather than showing a bias.
+
+Now if you're a fan of the Grizzlies, Hawks, Rockets (surprise, surprise), 76ers or Cavs, yes, Scott hates you.
+
+```{r}
+  kable(diffPlotData %>% filter(Season==2019, nn>=3, Official=="Scott Foster") %>% select(Season, Team, Official, FoulImpact, WinPctImpact, RefImpact))
+```
+
+And if you're the Warriors, Kings, Pacers or Lakers, you should be pretty happy when Scott Foster walks into your building. 
+
+#### How long has Foster hated the Rockets?
+
+I'm writing this in jest, I don't actually think Scott Foster actively hates the Rockets. Maybe just Chris Paul (we'll see when he joins OKC). But here's the breakdown of Scott Foster's RefImpact for the Rockets over time.
+
+```{r}
+  kable(diffPlotData %>% filter(Team=="HOU", Official=="Scott Foster") %>% select(Season, Team, Official, FoulImpact, WinPctImpact, RefImpact) %>% arrange(Season))
+```
+
+So, Scott Foster's fascination with the Rockets is really just a 2019 thing. He was actually quite pro-Houston in all years prior to 2019.
+
+
+### Wither Marc and Tony?
+
+The other two much maligned refs are Tony Brothers and Marc Davis. So here's a table for 2019 showing the Ref Impacts for Tony and Marc. There are some NAs since I've limited the number of games officiated to greater than or equal to five.
+
+```{r}
+  kable(diffPlotData %>% filter(Season==2019, nn>=3, Official=="Marc Davis" | Official == "Tony Brothers") %>% select(Season, Team, Official, RefImpact) %>% spread(key=Official, value=RefImpact))
+```
+
+### If you're playing Team X, which ref do you want to be there?
+
+Let's look at the NBA Champion Toronto Raptors. To answer this question, I've decided to make a heatmap. The code below provides a breakdown of how I'm making the heat map. 
+
+The adjustment I'm making takes Toronto's RefImpact scores for each referee and divides these impacts by the RefImpact scores for each referee and each team. For example, in 2019 Marc Davis had a ref impact score for Toronto of 94.86737 (in the table above), the code takes 94.86737 and divides it by every other team's RefImpact score for Marc Davis. Say we wanted to see a Toronto vs Golden State matchup if Marc Davis was an official in the game - we would take Toronto's score of 94.86737 and divide it by Golden State's RefImpact score of 139.58406. This would result in a score of 0.6796433. I multiply that by 100 to get a relative score of about 68. Any score less than 100 would favour Toronto in a matchup and anything more than 100 favours the other team. So a score of 68 favours the Raptors.
+
+Below is a heatmap of all RefImpact scores for each team and referee relative to the Toronto Raptors. Anything white to light gray would favour the Raptors, anything in that light-medium gray would be about even. Moving from medium-gray to  blue starts to slightly favour the opponent and blue to red to black becomes increasingly in favour of the opponent. Purple tiles are NAs - these are referee-opponent combinations that didn't occur in the 2019 dataset.
+
+
+```{r}
+TOR <- diffPlotData %>% filter(Season==2019, Team=="TOR") %>% select(Official, RefImpact)
+
+TORTable <- diffPlotData %>% filter(Season==2019, Team!="TOR", Official %in% TOR$Official) %>% select(Season, Team, Official, RefImpact) %>% spread(key=Official, value=RefImpact)
+
+adjustment <- TOR %>% spread(key=Official, value=RefImpact)
+adjustment <- adjustment[,-1]
+
+graphData <- tibble()
+
+for (i in 1:nrow(TORTable)){
+  graphData <- bind_rows(graphData,c(TORTable[i,1:2],100*adjustment/TORTable[i,3:ncol(TORTable)]))
+}
+
+graphData <- graphData %>% gather(key="Official", value="RefImpact", -Season, -Team)
+
+breaks <- c(50,150)
+
+blups <- brewer.pal(name="BuPu", n=9)
+
+sc <- rescale(graphData$RefImpact, to = c(0,1))
+
+ggplot(graphData, aes(Team, Official)) + geom_tile(aes(fill = RefImpact)) +
+  scale_fill_gradientn(colours= c('white', 'gray70', 'steelblue', 'red', 'black'), values =c(0,.1957, 0.33747, 0.47, 0.74), na.value = 'purple') #breaks in the scale bar
+        
+
+```
+
+Say the Raptors were set to play the Warriors, the best three-official team for the Raptors would be something like Ben Taylor, Marat Kogut and Tre Maddox. If you're the Warriors, the best three-official team would be Ron Garretson, Rodney Mott and Mike Callahan. 
+
+I think I may create a Shiny App in the coming days so you can select the Team and get a heatmap created custom for any Team and any Season.
+
+### Conclusion
+
+So there's a lot here and a lot more I can dig into. Thanks for reading and I hope to post something again soon!
+
+
